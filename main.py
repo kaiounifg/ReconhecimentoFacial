@@ -4,7 +4,16 @@ import time
 import cv2
 import face_recognition
 import numpy as np
-import winsound  # Biblioteca nativa do Windows para emitir bips sonoros
+import winsound
+
+# Import opcional para comunicação serial (catraca física)
+try:
+  import serial
+  import serial.tools.list_ports
+
+  SERIAL_DISPONIVEL = True
+except ImportError:
+  SERIAL_DISPONIVEL = False
 
 
 class SistemaAcessoUlife:
@@ -15,35 +24,73 @@ class SistemaAcessoUlife:
     self.conhecidos_ras = []
 
     self.frame_atual = None
+    self.frame_limpo_atual = None
     self.face_locations = []
     self.face_names = []
     self.face_colors = []
     self.face_confiancas = []
     self.instrucoes_distancia = []
 
-    # Controle de temporizador de 2.5 segundos para liberação
     self.tempo_reconhecimento_inicio = {}
     self.progresso_reconhecimento = {}
     self.TEMPO_NECESSARIO = 2.5
 
-    # Variável de controle para o bipe tocar apenas uma vez por acesso liberado
     self.acesso_liberado_recente = False
+    self.acesso_negado_recente = False
 
     self.running = True
     self.ready_to_process = True
 
-    # Variáveis de Interface
-    self.modo_input = None  # 'cadastro' ou 'deletar'
+    self.modo_input = None
     self.nome_digitado = ""
     self.frame_capturado = None
 
     self.ultimo_acesso_nome = ""
     self.tempo_ultimo_acesso = 0
 
+    self.ultimo_negado_nome = ""
+    self.tempo_ultimo_negado = 0
+
+    # Configuração da Catraca Física (Serial / Arduino)
+    self.porta_serial_nome = "COM3"
+    self.baud_rate = 9600
+    self.conexao_catraca = None
+    self.inicializar_catraca_fisica()
+
     if not os.path.exists(self.diretorio_fotos):
       os.makedirs(self.diretorio_fotos)
     if not os.path.exists("data"):
       os.makedirs("data")
+
+  def inicializar_catraca_fisica(self):
+    if SERIAL_DISPONIVEL:
+      try:
+        self.conexao_catraca = serial.Serial(
+            self.porta_serial_nome, self.baud_rate, timeout=1
+        )
+        time.sleep(2)
+        print(
+            f"[INFO] Catraca física conectada com sucesso na porta"
+            f" {self.porta_serial_nome}."
+        )
+      except Exception as e:
+        print(
+            f"[AVISO] Catraca física não encontrada em"
+            f" {self.porta_serial_nome}. Operando em MODO TESTE (Apenas"
+            f" Simulação/Bipe)."
+        )
+        self.conexao_catraca = None
+    else:
+      print(
+          "[AVISO] Biblioteca 'pyserial' não instalada. Operando em MODO TESTE."
+      )
+
+  def acionar_catraca_fisica(self):
+    if self.conexao_catraca and self.conexao_catraca.is_open:
+      try:
+        self.conexao_catraca.write(b"ABRIR\n")
+      except Exception as e:
+        print(f"[ERRO] Falha ao enviar comando para a catraca física: {e}")
 
   def treinar_sistema(self):
     novos_encodings, novos_ras = [], []
@@ -92,18 +139,20 @@ class SistemaAcessoUlife:
         ):
           ra_exibido, cor, conf_str = (
               "DESCONHECIDO",
-              (180, 180, 180),
+              (200, 200, 200),
               "",
-          )  # Cinza claro para desconhecido
+          )
+          is_cadastrado = False
+          nome_identificado = "DESCONHECIDO"
 
-          # Verificação de distância / tamanho do rosto
           altura_face = bottom - top
-          if altura_face < 35:
-            status_dist, cor_dist = "APROXIME O ROSTO", (0, 165, 255)
-          elif altura_face > 110:
-            status_dist, cor_dist = "AFASTE O ROSTO", (0, 165, 255)
+
+          if altura_face < 65:
+            status_dist, cor_dist = "APROXIME O ROSTO", (0, 140, 255)
+          elif altura_face > 240:
+            status_dist, cor_dist = "AFASTE O ROSTO", (0, 140, 255)
           else:
-            status_dist, cor_dist = "POSICAO IDEAL", (0, 255, 120)
+            status_dist, cor_dist = "", (0, 0, 0)
 
           if len(self.conhecidos_encodings) > 0:
             matches = face_recognition.compare_faces(
@@ -118,41 +167,52 @@ class SistemaAcessoUlife:
               if matches[best_match_index]:
                 nome_identificado = self.conhecidos_ras[best_match_index]
                 ra_exibido = f"ID: {nome_identificado}"
-                cor = (255, 255, 255)  # Branco elegante para reconhecido
+                cor = (255, 255, 255)
                 confianca = max(
                     0, min(100, (1 - dist[best_match_index]) * 100)
                 )
                 conf_str = f"{confianca:.1f}%"
+                is_cadastrado = True
 
-                rostos_detectados_agora.add(nome_identificado)
+          chave_temporizador = (
+              nome_identificado
+              if is_cadastrado
+              else f"DESCONHECIDO_{left}_{top}"
+          )
+          rostos_detectados_agora.add(chave_temporizador)
 
-                # Lógica de contagem de 2.5 segundos
-                tempo_atual = time.time()
-                if nome_identificado not in self.tempo_reconhecimento_inicio:
-                  self.tempo_reconhecimento_inicio[nome_identificado] = (
-                      tempo_atual
-                  )
+          tempo_atual = time.time()
+          if chave_temporizador not in self.tempo_reconhecimento_inicio:
+            self.tempo_reconhecimento_inicio[chave_temporizador] = tempo_atual
 
-                decorrido = (
-                    tempo_atual
-                    - self.tempo_reconhecimento_inicio[nome_identificado]
-                )
-                progresso = min(1.0, decorrido / self.TEMPO_NECESSARIO)
-                self.progresso_reconhecimento[nome_identificado] = progresso
+          decorrido = (
+              tempo_atual - self.tempo_reconhecimento_inicio[chave_temporizador]
+          )
+          progresso = min(1.0, decorrido / self.TEMPO_NECESSARIO)
+          self.progresso_reconhecimento[chave_temporizador] = progresso
 
-                if progresso >= 1.0:
-                  self.ultimo_acesso_nome = nome_identificado
-                  self.tempo_ultimo_acesso = tempo_atual
+          if progresso >= 1.0:
+            if is_cadastrado:
+              self.ultimo_acesso_nome = nome_identificado
+              self.tempo_ultimo_acesso = tempo_atual
 
-                  # Dispara o sinal sonoro simulando a catraca abrindo (apenas 1 vez por ciclo)
-                  if not self.acesso_liberado_recente:
-                    try:
-                      winsound.Beep(
-                          2000, 300
-                      )  # Bipe de 2000Hz por 300ms indicando catraca aberta
-                    except:
-                      pass
-                    self.acesso_liberado_recente = True
+              if not self.acesso_liberado_recente:
+                try:
+                  winsound.Beep(2200, 250)
+                except:
+                  pass
+                self.acionar_catraca_fisica()
+                self.acesso_liberado_recente = True
+            else:
+              self.ultimo_negado_nome = "DESCONHECIDO"
+              self.tempo_ultimo_negado = tempo_atual
+
+              if not self.acesso_negado_recente:
+                try:
+                  winsound.Beep(600, 400)
+                except:
+                  pass
+                self.acesso_negado_recente = True
 
           temp_names.append(ra_exibido)
           temp_colors.append(cor)
@@ -192,26 +252,28 @@ class SistemaAcessoUlife:
     altura, largura = frame.shape[:2]
     overlay = frame.copy()
 
-    cv2.rectangle(overlay, (0, 0), (largura, 65), (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+    cv2.rectangle(overlay, (0, 0), (largura, 70), (15, 15, 15), -1)
+    cv2.addWeighted(overlay, 0.9, frame, 0.1, 0, frame)
+
+    cv2.line(frame, (0, 70), (largura, 70), (45, 45, 45), 1, cv2.LINE_AA)
 
     cv2.putText(
         frame,
-        "ULIFE ACCESS // CONTROLE DE CATRACA",
-        (30, 28),
+        "ULIFE ACCESS // SECURE GATEWAY",
+        (35, 30),
         cv2.FONT_HERSHEY_DUPLEX,
-        0.55,
-        (255, 255, 255),
+        0.6,
+        (240, 240, 240),
         1,
         cv2.LINE_AA,
     )
     cv2.putText(
         frame,
-        "Posicione o rosto no visor",
-        (30, 48),
+        "Sistema de Identificacao Facial Biometrica",
+        (35, 52),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.4,
-        (180, 180, 180),
+        (160, 160, 160),
         1,
         cv2.LINE_AA,
     )
@@ -242,13 +304,16 @@ class SistemaAcessoUlife:
         frame = cv2.flip(frame, 1)
         altura, largura = frame.shape[:2]
 
+        # Cópia limpa do frame sem elementos gráficos (usada para o cadastro)
+        frame_limpo = frame.copy()
+
         if not self.modo_input:
-          small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+          small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
           self.frame_atual = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-          # Se nenhum rosto reconhecido recente estiver na tela, reseta a trava do bipe
           if len(self.tempo_reconhecimento_inicio) == 0:
             self.acesso_liberado_recente = False
+            self.acesso_negado_recente = False
 
           for (
               (top, right, bottom, left),
@@ -263,21 +328,21 @@ class SistemaAcessoUlife:
               self.face_confiancas,
               self.instrucoes_distancia,
           ):
-            top *= 4
-            right *= 4
-            bottom *= 4
-            left *= 4
+            top *= 2
+            right *= 2
+            bottom *= 2
+            left *= 2
 
             self.desenhar_cantos_retangulo(
                 frame, (left, top), (right, bottom), cor, thickness=2, r_len=18
             )
 
-            label_bg_bottom = bottom + 34
+            label_bg_bottom = bottom + 38
             cv2.rectangle(
                 frame,
                 (left, bottom),
                 (right, label_bg_bottom),
-                (35, 35, 35),
+                (25, 25, 25),
                 -1,
             )
             cv2.rectangle(
@@ -286,7 +351,7 @@ class SistemaAcessoUlife:
             cv2.putText(
                 frame,
                 name,
-                (left + 8, bottom + 23),
+                (left + 10, bottom + 25),
                 cv2.FONT_HERSHEY_DUPLEX,
                 0.52,
                 (255, 255, 255),
@@ -294,82 +359,127 @@ class SistemaAcessoUlife:
                 cv2.LINE_AA,
             )
 
-            if "ID: " in name:
-              nome_chave = name.replace("ID: ", "").strip()
-              if nome_chave in self.progresso_reconhecimento:
-                prog = self.progresso_reconhecimento[nome_chave]
-                largura_barra = right - left
-                altura_barra = 5
-                barra_preenchida = int(largura_barra * prog)
+            chave_prog = (
+                name.replace("ID: ", "").strip()
+                if "ID: " in name
+                else f"DESCONHECIDO_{left//2}_{top//2}"
+            )
+            if chave_prog in self.progresso_reconhecimento:
+              prog = self.progresso_reconhecimento[chave_prog]
+              largura_barra = right - left
+              altura_barra = 4
+              barra_preenchida = int(largura_barra * prog)
 
+              cv2.rectangle(
+                  frame,
+                  (left, label_bg_bottom + 2),
+                  (right, label_bg_bottom + 2 + altura_barra),
+                  (50, 50, 50),
+                  -1,
+              )
+              if barra_preenchida > 0:
                 cv2.rectangle(
                     frame,
-                    (left, label_bg_bottom + 4),
-                    (right, label_bg_bottom + 4 + altura_barra),
-                    (60, 60, 60),
+                    (left, label_bg_bottom + 2),
+                    (left + barra_preenchida, label_bg_bottom + 2 + altura_barra),
+                    (255, 255, 255),
                     -1,
                 )
-                if barra_preenchida > 0:
-                  cv2.rectangle(
-                      frame,
-                      (left, label_bg_bottom + 4),
-                      (left + barra_preenchida, label_bg_bottom + 4 + altura_barra),
-                      (255, 255, 255),
-                      -1,
-                  )
 
             if conf:
               cv2.putText(
                   frame,
                   conf,
-                  (right - 55, top - 12),
+                  (right - 58, top - 12),
                   cv2.FONT_HERSHEY_SIMPLEX,
                   0.42,
-                  (255, 255, 255),
+                  (220, 220, 220),
                   1,
                   cv2.LINE_AA,
               )
 
-            cv2.putText(
-                frame,
-                status_dist,
-                (left, top - 12),
-                cv2.FONT_HERSHEY_DUPLEX,
-                0.45,
-                cor_dist,
-                1,
-                cv2.LINE_AA,
-            )
+            if status_dist:
+              cv2.putText(
+                  frame,
+                  status_dist,
+                  (left, top - 12),
+                  cv2.FONT_HERSHEY_DUPLEX,
+                  0.45,
+                  cor_dist,
+                  1,
+                  cv2.LINE_AA,
+              )
 
           if (
-              time.time() - self.tempo_ultimo_acesso < 3.0
+              time.time() - self.tempo_ultimo_acesso < 5.0
               and self.ultimo_acesso_nome
           ):
-            banner_w, banner_h = 420, 80
+            banner_w, banner_h = 460, 90
             bx1 = (largura - banner_w) // 2
-            by1 = 90
+            by1 = 95
             bx2 = bx1 + banner_w
             by2 = by1 + banner_h
 
-            cv2.rectangle(frame, (bx1, by1), (bx2, by2), (25, 25, 25), -1)
-            cv2.rectangle(frame, (bx1, by1), (bx2, by2), (255, 255, 255), 2)
+            overlay_banner = frame.copy()
+            cv2.rectangle(
+                overlay_banner, (bx1, by1), (bx2, by2), (20, 20, 20), -1
+            )
+            cv2.addWeighted(overlay_banner, 0.85, frame, 0.15, 0, frame)
+            cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 220, 120), 2)
             cv2.putText(
                 frame,
                 "ACESSO LIBERADO",
-                (bx1 + 105, by1 + 28),
+                (bx1 + 120, by1 + 32),
                 cv2.FONT_HERSHEY_DUPLEX,
-                0.55,
-                (255, 255, 255),
+                0.6,
+                (0, 255, 130),
                 1,
                 cv2.LINE_AA,
             )
             cv2.putText(
                 frame,
                 f"Bem-vindo(a), {self.ultimo_acesso_nome}",
-                (bx1 + 65, by1 + 58),
+                (bx1 + 75, by1 + 65),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (230, 230, 230),
+                1,
+                cv2.LINE_AA,
+            )
+
+          if (
+              time.time() - self.tempo_ultimo_negado < 5.0
+              and self.ultimo_negado_nome
+          ):
+            banner_w, banner_h = 460, 90
+            bx1 = (largura - banner_w) // 2
+            by1 = 95
+            bx2 = bx1 + banner_w
+            by2 = by1 + banner_h
+
+            overlay_banner = frame.copy()
+            cv2.rectangle(
+                overlay_banner, (bx1, by1), (bx2, by2), (15, 10, 10), -1
+            )
+            cv2.addWeighted(overlay_banner, 0.85, frame, 0.15, 0, frame)
+            cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 0, 240), 2)
+            cv2.putText(
+                frame,
+                "ACESSO NEGADO",
+                (bx1 + 130, by1 + 32),
+                cv2.FONT_HERSHEY_DUPLEX,
+                0.6,
+                (0, 0, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                frame,
+                "Rosto nao cadastrado no sistema",
+                (bx1 + 90, by1 + 65),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.48,
-                (200, 200, 200),
+                (230, 230, 230),
                 1,
                 cv2.LINE_AA,
             )
@@ -379,52 +489,52 @@ class SistemaAcessoUlife:
         else:
           overlay = frame.copy()
           cv2.rectangle(overlay, (0, 0), (largura, altura), (0, 0, 0), -1)
-          cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+          cv2.addWeighted(overlay, 0.9, frame, 0.1, 0, frame)
 
-          modal_l, modal_a = 640, 240
+          modal_l, modal_a = 660, 260
           x1 = (largura - modal_l) // 2
           y1 = (altura - modal_a) // 2
           x2 = x1 + modal_l
           y2 = y1 + modal_a
 
-          cv2.rectangle(frame, (x1, y1), (x2, y2), (30, 30, 30), -1)
-          cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 2)
+          cv2.rectangle(frame, (x1, y1), (x2, y2), (25, 25, 25), -1)
+          cv2.rectangle(frame, (x1, y1), (x2, y2), (100, 100, 100), 1)
 
           is_cadastro = self.modo_input == "cadastro"
           titulo = (
-              "MODO ADMIN: CADASTRAR ROSTO"
+              "PAINEL ADMIN // CADASTRAR REGISTRO"
               if is_cadastro
-              else "MODO ADMIN: DELETAR REGISTRO"
+              else "PAINEL ADMIN // REMOVER REGISTRO"
           )
-          cor_texto = (255, 255, 255) if is_cadastro else (0, 0, 255)
+          cor_texto = (255, 255, 255) if is_cadastro else (80, 80, 255)
 
           cv2.putText(
               frame,
               titulo,
-              (x1 + 30, y1 + 42),
+              (x1 + 35, y1 + 45),
               cv2.FONT_HERSHEY_DUPLEX,
-              0.6,
-              (255, 255, 255),
+              0.58,
+              (240, 240, 240),
               1,
               cv2.LINE_AA,
           )
           cv2.putText(
               frame,
-              f"RA/NOME: {self.nome_digitado}_",
-              (x1 + 30, y1 + 120),
+              f"ID / NOME: {self.nome_digitado}_",
+              (x1 + 35, y1 + 130),
               cv2.FONT_HERSHEY_DUPLEX,
-              0.85,
+              0.8,
               cor_texto,
               2,
               cv2.LINE_AA,
           )
           cv2.putText(
               frame,
-              "[ENTER] Confirmar    |    [ESC] Sair do Modo Admin",
-              (x1 + 30, y1 + 190),
+              "[ENTER] Confirmar Operacao    |    [ESC] Retornar",
+              (x1 + 35, y1 + 205),
               cv2.FONT_HERSHEY_SIMPLEX,
-              0.5,
-              (180, 180, 180),
+              0.45,
+              (170, 170, 170),
               1,
               cv2.LINE_AA,
           )
@@ -438,14 +548,15 @@ class SistemaAcessoUlife:
           elif key == ord("c") or key == ord("C"):
             self.modo_input = "cadastro"
             self.nome_digitado = ""
-            self.frame_capturado = frame.copy()
+            # Salva exatamente o frame limpo, sem banners ou textos da interface
+            self.frame_capturado = frame_limpo.copy()
           elif key == ord("d") or key == ord("D"):
             self.modo_input = "deletar"
             self.nome_digitado = ""
         else:
-          if key == 27:  # ESC
+          if key == 27:
             self.modo_input = None
-          elif key == 13:  # ENTER
+          elif key == 13:
             nome_alvo = self.nome_digitado.strip()
             if is_cadastro and nome_alvo:
               caminho_salvar = os.path.join(
@@ -459,12 +570,14 @@ class SistemaAcessoUlife:
 
             self.treinar_sistema()
             self.modo_input = None
-          elif key == 8 or key == 127:  # Backspace
+          elif key == 8 or key == 127:
             self.nome_digitado = self.nome_digitado[:-1]
           elif 32 <= key <= 126:
             self.nome_digitado += chr(key)
     finally:
       self.running = False
+      if self.conexao_catraca and self.conexao_catraca.is_open:
+        self.conexao_catraca.close()
       video_capture.release()
       cv2.destroyAllWindows()
 
